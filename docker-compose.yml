@@ -2,9 +2,12 @@ services:
   tenable-tie-mcp:
     build: .
     ports:
-      - "8000:8000"
+      # Loopback only: the SSE transport is unauthenticated, and anyone who can
+      # reach it inherits the configured API key's permissions.
+      - "127.0.0.1:8000:8000"
     environment:
       - TIE_URL=${TIE_URL}
       - TIE_API_KEY=${TIE_API_KEY}
       - TIE_VERIFY_SSL=${TIE_VERIFY_SSL:-true}
+      - TIE_ALLOW_WRITES=${TIE_ALLOW_WRITES:-false}
     restart: unless-stopped

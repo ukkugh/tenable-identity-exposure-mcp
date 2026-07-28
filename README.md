@@ -27,6 +27,26 @@ Verified end-to-end against a live TIE SaaS instance (`v3.120.1`).
 | `tie_search_events` | Search AD security events in a date range |
 | `tie_search_ad_objects` | Search AD objects (users/computers/groups/OUs) |
 | `tie_whoami` | Current user identity, roles, permissions |
+| `tie_checkers_summary` | All IoE checker definitions, essential fields only (no description blobs) |
+| `tie_deviances_bulk` | All active IoE deviances in a few paginated calls |
+
+### Read-only by default
+
+Non-GET calls are **refused** unless the server is started with `--allow-writes`
+(or `TIE_ALLOW_WRITES=true`). This applies to `tie_request` and to the
+`create`/`update`/`delete` actions of `tie_resource_action`.
+
+Some resources are never writable, even with `--allow-writes`:
+`api-key`, `users`, `roles`, `saml-configuration`, `ldap-configuration`,
+`syslogs`, `lockout-policy`, `application-settings`, `attack-type-configuration`.
+Rotating the API key would deactivate the credential this server is running on;
+the rest reconfigure authentication, access control, or log forwarding.
+
+`tie_request` also refuses absolute URLs — only server-relative paths such as
+`/api/about` are accepted, so the API key cannot be sent to another host.
+
+None of this replaces server-side authorization. Scope the API key to a
+least-privilege TIE role as well.
 
 ### Time windows, profiles, and token budget
 
@@ -40,15 +60,28 @@ Verified end-to-end against a live TIE SaaS instance (`v3.120.1`).
 
 ## Configuration
 
-Set via environment variables (or `--tie-url` / `--tie-api-key` flags):
+Set via environment variables (or the equivalent CLI flags):
 
-| Variable | Description |
-|---|---|
-| `TIE_URL` | Base URL, e.g. `https://your-host.tenable.ad` |
-| `TIE_API_KEY` | API key (TIE console → **System → Configuration → API key**) |
-| `TIE_VERIFY_SSL` | `true` (default) or `false` for self-signed certs |
+| Variable | Flag | Description |
+|---|---|---|
+| `TIE_URL` | `--tie-url` | Base URL, e.g. `https://your-client.tenable.ad` |
+| `TIE_API_KEY` | `--tie-api-key` | API key (see below) |
+| `TIE_VERIFY_SSL` | `--no-verify-ssl` | `true` (default); `false` for self-signed certs |
+| `TIE_ALLOW_WRITES` | `--allow-writes` | `false` (default) — see [Read-only by default](#read-only-by-default) |
 
 Auth uses the `X-API-Key` header.
+
+**Getting the API key:** TIE console → user profile icon (top right) →
+**My Account** / **Preferences** → **API key**. It is a *per-user* setting, the
+same path on SaaS and on-premises. The key inherits the issuing account's role
+permissions, so create a dedicated least-privilege service account for it.
+
+**Not a Tenable Vulnerability Management key.** TIE uses a single opaque key in an
+`x-api-key` header against your own console hostname (`https://<client>.tenable.ad`).
+Tenable VM / Tenable One use an `accessKey`+`secretKey` pair in an
+`X-ApiKeys` header against `cloud.tenable.com`. They are not interchangeable — and
+if Tenable Cloud Data Collection is enabled, TIE auto-creates `tie-{username}-{random}`
+accounts inside your Tenable VM container that will *not* work here.
 
 ## Install & run
 
@@ -62,9 +95,18 @@ cp .env.example .env   # fill in TIE_URL and TIE_API_KEY
 set -a; . ./.env; set +a
 tenable-tie-mcp
 
-# or network transports
+# or network transports (bind 127.0.0.1 by default — they have no auth of
+# their own, so widen --host only behind an authenticating proxy)
 tenable-tie-mcp --transport sse --port 8000
 tenable-tie-mcp --transport http --port 8000
+```
+
+### Tests
+
+```bash
+uv pip install --group dev
+pytest
+mypy
 ```
 
 ### Running with uv / uvx (alternative to a manual venv)

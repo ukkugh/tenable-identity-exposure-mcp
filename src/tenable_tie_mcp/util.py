@@ -21,8 +21,16 @@ def iso_utc(dt: datetime) -> str:
 
 
 def parse_iso(value: str) -> datetime:
-    """Parse an ISO 8601 string (accepting a trailing Z) to an aware UTC datetime."""
-    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+    """Parse an ISO 8601 string (accepting a trailing Z) to an aware UTC datetime.
+
+    Values without an offset are treated as UTC, matching what the tool
+    docstrings promise. Without this, `.astimezone()` would read them as host
+    local time and skew the window by the machine's UTC offset.
+    """
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def resolve_window(
@@ -60,7 +68,7 @@ def render_description(obj: dict[str, Any]) -> str | None:
         return None
     attrs = {
         a.get("name"): a.get("value")
-        for a in obj.get("attributes", [])
+        for a in (obj.get("attributes") or [])
         if isinstance(a, dict)
     }
     return _PLACEHOLDER.sub(lambda m: str(attrs.get(m.group(1), m.group(0))), template)

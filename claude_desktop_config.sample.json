@@ -1,9 +1,9 @@
 {
   "mcpServers": {
     "tenable-tie": {
-      "command": "/Users/kteo/claudeCode/tenable-ie-mcp/.venv/bin/tenable-tie-mcp",
+      "command": "/absolute/path/to/tenable-ie-mcp/.venv/bin/tenable-tie-mcp",
       "env": {
-        "TIE_URL": "https://your-host.tenable.ad",
+        "TIE_URL": "https://your-client.tenable.ad",
         "TIE_API_KEY": "<replace-with-your-api-key>",
         "TIE_VERIFY_SSL": "true"
       }

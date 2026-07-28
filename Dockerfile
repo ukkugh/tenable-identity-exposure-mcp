@@ -16,4 +16,7 @@ ENV TIE_VERIFY_SSL="true"
 EXPOSE 8000
 
 ENTRYPOINT ["tenable-tie-mcp"]
-CMD ["--transport", "sse", "--port", "8000"]
+# 0.0.0.0 is required to reach the port from outside the container. The SSE
+# endpoint has no authentication of its own, so publish it on loopback only
+# (see docker-compose.yml) or front it with an authenticating proxy.
+CMD ["--transport", "sse", "--host", "0.0.0.0", "--port", "8000"]
