@@ -300,6 +300,146 @@ class TestDeviancesBulkPagination:
         assert "note" in result
 
 
+def _ad_object(oid: int, cn: str, *, directory_id: int = 6, klass: str = "user",
+               extra: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    return {
+        "id": oid,
+        "directoryId": directory_id,
+        "type": "LDAP",
+        "objectId": f"{directory_id}:{oid:08x}",
+        "objectAttributes": [
+            {"name": "cn", "value": f'"{cn}"', "valueType": "string"},
+            {"name": "objectclass", "value": f'["top","{klass}"]', "valueType": "array/string"},
+            {"name": "distinguishedname", "value": f'"CN={cn},DC=corp,DC=local"',
+             "valueType": "string"},
+            *(extra or []),
+        ],
+    }
+
+
+def _ad_page(objects: list[dict[str, Any]], *, more: bool = False) -> dict[str, Any]:
+    links = {"next": "https://tie.example/api/ad-objects?lastIdentifierSeen=1"} if more else {}
+    return {"_embedded": {"ad-objects": objects}, "_links": links}
+
+
+class TestSearchAdObjects:
+    """GET /api/ad-objects has no server-side search: search/page/perPage are
+    rejected with HTTP 400, and an unfiltered call returns the whole directory."""
+
+    async def test_only_supported_query_params_are_sent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = FakeClient(responses={"/api/ad-objects": _ad_page([])})
+        monkeypatch.setattr(server, "_client", client)
+
+        await server.tie_search_ad_objects(query="admin")
+
+        sent = set(client.calls[0]["params"] or {})
+        assert not sent & {"search", "page", "perPage", "directoryId", "type", "limit"}
+        assert sent <= {"batchSize", "lastIdentifierSeen", "timestamp"}
+
+    async def test_matches_are_found_in_the_plural_envelope(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _ad_page([_ad_object(1, "Administrator"), _ad_object(2, "guest")])
+        client = FakeClient(responses={"/api/ad-objects": page})
+        monkeypatch.setattr(server, "_client", client)
+
+        result = await server.tie_search_ad_objects(query="admin")
+
+        assert result["matched"] == 1
+        assert result["objects"][0]["id"] == 1
+
+    async def test_query_is_case_insensitive_and_matches_dn(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _ad_page([_ad_object(1, "svc-backup")])
+        client = FakeClient(responses={"/api/ad-objects": page})
+        monkeypatch.setattr(server, "_client", client)
+
+        result = await server.tie_search_ad_objects(query="DC=CORP")
+
+        assert result["matched"] == 1
+
+    async def test_bulk_attribute_blobs_do_not_produce_matches(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Searching every attribute would match on ACL blobs, not on names."""
+        noisy = _ad_object(
+            1, "unrelated",
+            extra=[{"name": "ntsecuritydescriptor", "value": '"O:S-1-5-32-544 needle"',
+                    "valueType": "string"}],
+        )
+        client = FakeClient(responses={"/api/ad-objects": _ad_page([noisy])})
+        monkeypatch.setattr(server, "_client", client)
+
+        result = await server.tie_search_ad_objects(query="needle")
+
+        assert result["matched"] == 0
+
+    async def test_directory_and_class_filters_apply_client_side(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _ad_page([
+            _ad_object(1, "admin-a", directory_id=6, klass="user"),
+            _ad_object(2, "admin-b", directory_id=7, klass="user"),
+            _ad_object(3, "admin-c", directory_id=6, klass="computer"),
+        ])
+        client = FakeClient(responses={"/api/ad-objects": page})
+        monkeypatch.setattr(server, "_client", client)
+
+        result = await server.tie_search_ad_objects(
+            query="admin", directory_id=6, object_class="user"
+        )
+
+        assert [o["id"] for o in result["objects"]] == [1]
+
+    async def test_cursor_walks_pages(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        first = _ad_page([_ad_object(i, f"admin{i}") for i in range(1, 4)], more=True)
+        second = _ad_page([_ad_object(9, "admin9")])
+        client = FakeClient(pages={"/api/ad-objects": [first, second]})
+        monkeypatch.setattr(server, "_client", client)
+
+        result = await server.tie_search_ad_objects(query="admin", max_scanned=6)
+
+        assert result["scanned"] == 4
+        assert client.calls[1]["params"]["lastIdentifierSeen"] == 3
+
+    async def test_result_cap_is_reported(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _ad_page([_ad_object(i, f"admin{i}") for i in range(1, 6)])
+        client = FakeClient(responses={"/api/ad-objects": page})
+        monkeypatch.setattr(server, "_client", client)
+
+        result = await server.tie_search_ad_objects(query="admin", max_results=2)
+
+        assert len(result["objects"]) == 2
+        assert result["truncated"] is True
+
+    async def test_oversized_attributes_are_slimmed_unless_verbose(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        blob = {"name": "ntsecuritydescriptor", "value": "x" * 900, "valueType": "string"}
+        page = _ad_page([_ad_object(1, "admin", extra=[blob])])
+        client = FakeClient(responses={"/api/ad-objects": page})
+        monkeypatch.setattr(server, "_client", client)
+
+        slim = await server.tie_search_ad_objects(query="admin")
+        values = [a["value"] for a in slim["objects"][0]["objectAttributes"]]
+        assert not any(len(str(v)) > 300 for v in values)
+
+        client.pages.clear()
+        full = await server.tie_search_ad_objects(query="admin", verbose=True)
+        assert any(len(str(a["value"])) == 900 for a in full["objects"][0]["objectAttributes"])
+
+    async def test_unexpected_shape_is_an_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = FakeClient(responses={"/api/ad-objects": {"unexpected": True}})
+        monkeypatch.setattr(server, "_client", client)
+
+        result = await server.tie_search_ad_objects(query="admin")
+
+        assert "error" in result
+
+
 class TestEntryPoint:
     """The network transports were never reachable: FastMCP.run() takes no
     host/port, so --transport sse/http raised TypeError before binding."""

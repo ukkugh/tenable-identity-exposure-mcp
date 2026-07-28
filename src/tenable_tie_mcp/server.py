@@ -98,6 +98,65 @@ def _protected_error(what: str) -> dict[str, Any]:
     }
 
 
+# /api/ad-objects answers ~1000 objects per page and offers no server-side
+# search, so name matching happens here — against naming attributes only, since
+# scanning every value would hit ACL and certificate blobs instead of names.
+_AD_OBJECT_BATCH = 1000
+_NAME_ATTRIBUTES: frozenset[str] = frozenset(
+    {"cn", "name", "displayname", "samaccountname", "distinguishedname", "userprincipalname"}
+)
+
+
+def _extract_ad_objects(raw: Any) -> list[Any] | None:
+    """Pull AD objects out of a page, or None if the shape is unknown."""
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, dict):
+        embedded = raw.get("_embedded")
+        if isinstance(embedded, dict):
+            # The live API answers with the plural key; the published spec says singular.
+            for key in ("ad-objects", "ad-object"):
+                if isinstance(embedded.get(key), list):
+                    return list(embedded[key])
+    return None
+
+
+def _has_next_page(raw: Any) -> bool | None:
+    """Whether the API says more pages follow, or None if it did not say.
+
+    /api/ad-objects advertises pagination through `_links.next`; falling back to
+    a short-page guess would keep asking after the last page on an API that
+    honours batchSize loosely.
+    """
+    if isinstance(raw, dict):
+        links = raw.get("_links")
+        if isinstance(links, dict):
+            return bool(links.get("next"))
+    return None
+
+
+def _attribute_contains(obj: dict[str, Any], attribute: str, needle: str) -> bool:
+    for a in obj.get("objectAttributes") or []:
+        if isinstance(a, dict) and str(a.get("name", "")).lower() == attribute:
+            if needle in str(a.get("value", "")).lower():
+                return True
+    return False
+
+
+def _object_name_contains(obj: dict[str, Any], needle: str) -> bool:
+    if not needle:
+        return True
+    if needle in str(obj.get("objectId", "")).lower():
+        return True
+    for a in obj.get("objectAttributes") or []:
+        if not isinstance(a, dict):
+            continue
+        if str(a.get("name", "")).lower() in _NAME_ATTRIBUTES:
+            if needle in str(a.get("value", "")).lower():
+                return True
+    return False
+
+
 def _extract_deviance_page(raw: Any) -> list[Any] | None:
     """Pull the deviance records out of a page, or None if the shape is unknown."""
     if isinstance(raw, list):
@@ -575,29 +634,120 @@ async def tie_whoami() -> Any:
 async def tie_search_ad_objects(
     query: str,
     directory_id: int | None = None,
-    object_type: str | None = None,
-    page: int = 1,
-    per_page: int = 50,
+    object_class: str | None = None,
+    max_results: int = 50,
+    max_scanned: int = 5000,
+    timestamp: str | None = None,
+    verbose: bool = False,
 ) -> Any:
-    """Search Active Directory objects (users, computers, groups, OUs) by name or attribute.
+    """Find Active Directory objects whose name or DN contains `query`.
+
+    IMPORTANT: /api/ad-objects has no server-side search. It returns the last
+    known state of *every* object, cursor-paginated (~1000 per page, roughly
+    2 MB each on a small forest). Filtering here is therefore CLIENT-SIDE, and
+    only objects within the scanned prefix can match — raise `max_scanned` to
+    widen the sweep, and read `scanned`/`truncated` in the result before
+    concluding that something does not exist.
+
+    For deviance investigation prefer tie_deviances / tie_deviances_by_checker,
+    which are filtered server-side.
 
     Args:
-        query: Search string to match against AD object names/attributes.
-        directory_id: Restrict search to a specific directory.
-        object_type: Filter by object type: "user", "computer", "group", "ou".
-        page: Page number (1-based).
-        per_page: Results per page.
+        query: Substring to look for, case-insensitive. Matched against objectId
+            and the naming attributes (cn, name, displayName, sAMAccountName,
+            distinguishedName, userPrincipalName) — not against bulk blobs like
+            ntSecurityDescriptor, which would produce meaningless hits.
+        directory_id: Restrict to one directory (see resource="directories").
+        object_class: Substring of the objectClass attribute, e.g. "user",
+            "computer", "group", "organizationalUnit". Note this is the LDAP
+            objectClass; the object's own `type` field is the data source
+            (LDAP or SYSVOL), not the object category.
+        max_results: Stop after this many matches (default 50).
+        max_scanned: Cap on objects fetched while searching (default 5000).
+        timestamp: Optional ISO 8601 UTC point in time; defaults to now.
+        verbose: If False (default), oversized attribute values are dropped.
     """
     client = get_client()
-    params: dict[str, Any] = {"search": query, "page": page, "perPage": per_page}
-    if directory_id is not None:
-        params["directoryId"] = directory_id
-    if object_type is not None:
-        params["type"] = object_type
-    try:
-        return await client.get("/api/ad-objects", params=params)
-    except TIEApiError as exc:
-        return {"error": str(exc), "status": exc.status}
+    needle = query.lower()
+    class_needle = object_class.lower() if object_class else None
+
+    matches: list[Any] = []
+    scanned = 0
+    last_id: int | None = None
+    hit_result_cap = False
+    exhausted = False
+
+    while scanned < max_scanned and not hit_result_cap:
+        batch = min(_AD_OBJECT_BATCH, max_scanned - scanned)
+        params: dict[str, Any] = {"batchSize": batch}
+        if last_id is not None:
+            params["lastIdentifierSeen"] = last_id
+        if timestamp is not None:
+            params["timestamp"] = timestamp
+
+        try:
+            raw_page = await client.get("/api/ad-objects", params=params)
+        except TIEApiError as exc:
+            return {"error": str(exc), "status": exc.status}
+
+        items = _extract_ad_objects(raw_page)
+        if items is None:
+            return {
+                "error": (
+                    "unexpected response shape from /api/ad-objects: expected a list or "
+                    "{'_embedded': {'ad-objects': [...]}}, got "
+                    f"{sorted(raw_page) if isinstance(raw_page, dict) else type(raw_page).__name__}"
+                ),
+                "status": 0,
+            }
+        if not items:
+            exhausted = True
+            break
+
+        scanned += len(items)
+        ids = [o["id"] for o in items if isinstance(o, dict) and o.get("id") is not None]
+        if ids:
+            last_id = max(ids)
+
+        for obj in items:
+            if not isinstance(obj, dict):
+                continue
+            if directory_id is not None and obj.get("directoryId") != directory_id:
+                continue
+            if class_needle is not None and not _attribute_contains(
+                obj, "objectclass", class_needle
+            ):
+                continue
+            if not _object_name_contains(obj, needle):
+                continue
+            matches.append(slim_object(obj, verbose))
+            if len(matches) >= max_results:
+                hit_result_cap = True
+                break
+
+        has_next = _has_next_page(raw_page)
+        if has_next is False or (has_next is None and len(items) < batch):
+            exhausted = True
+            break
+
+    notes: list[str] = []
+    if hit_result_cap:
+        notes.append(f"Stopped at max_results={max_results}; there may be more matches.")
+    if not exhausted and not hit_result_cap:
+        notes.append(
+            f"Stopped after scanning {scanned} objects (max_scanned={max_scanned}); "
+            "the directory was not searched exhaustively."
+        )
+
+    return {
+        "query": query,
+        "scanned": scanned,
+        "matched": len(matches),
+        "truncated": bool(notes),
+        "filtering": "client-side (the API offers no server-side search)",
+        "notes": notes,
+        "objects": matches,
+    }
 
 
 @mcp.tool()
