@@ -662,7 +662,9 @@ async def tie_deviances_bulk(
         if last_id is not None:
             params["lastIdentifierSeen"] = last_id
         if not resolved:
-            params["resolved"] = "false"
+            # The API validates this against the enum ["0", "1"]; "false" is
+            # rejected outright with HTTP 400 INVALID_PAYLOAD_FORMAT.
+            params["resolved"] = "0"
 
         try:
             raw_page = await client.get("/api/deviances/changed", params=params)

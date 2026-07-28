@@ -268,6 +268,28 @@ class TestDeviancesBulkPagination:
         # Second call must resume from the highest id seen, not restart.
         assert client.calls[1]["params"]["lastIdentifierSeen"] == 2
 
+    async def test_resolved_filter_uses_the_documented_enum(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The API validates `resolved` against ["0", "1"]; sending "false"
+        makes the whole call fail with HTTP 400 INVALID_PAYLOAD_FORMAT."""
+        client = FakeClient(responses={"/api/deviances/changed": []})
+        monkeypatch.setattr(server, "_client", client)
+
+        await server.tie_deviances_bulk(resolved=False)
+
+        assert client.calls[0]["params"]["resolved"] == "0"
+
+    async def test_resolved_true_omits_the_filter(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = FakeClient(responses={"/api/deviances/changed": []})
+        monkeypatch.setattr(server, "_client", client)
+
+        await server.tie_deviances_bulk(resolved=True)
+
+        assert "resolved" not in client.calls[0]["params"]
+
     async def test_truncation_is_reported(self, monkeypatch: pytest.MonkeyPatch) -> None:
         full = {"_embedded": {"deviance": [{"id": 1, "profileId": 1}]}}
         client = FakeClient(pages={"/api/deviances/changed": [full, full, full]})
