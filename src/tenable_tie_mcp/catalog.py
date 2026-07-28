@@ -8,33 +8,62 @@ under parent paths and are exposed through dedicated tools in server.py.
 
 from __future__ import annotations
 
-# Flat resources: (path, supports_get_by_id, description)
-# All verified to return HTTP 200 on a live instance.
-TIE_RESOURCES: dict[str, tuple[str, bool, str]] = {
-    "about":                ("/api/about",                 False, "Product version and build info"),
-    "ad-objects":           ("/api/ad-objects",            True,  "Active Directory objects (users, computers, groups, OUs)"),
-    "api-key":              ("/api/api-key",               False, "Current API key info"),
-    "application-settings": ("/api/application-settings",  False, "Global application settings (GET/PATCH)"),
-    "attack-type-configuration": ("/api/attack-type-configuration", False, "Attack type configuration (GET/PATCH)"),
-    "attack-types":         ("/api/attack-types",          True,  "Attack (IoA) type definitions"),
-    "categories":           ("/api/categories",            True,  "Indicator of Exposure (IoE) categories"),
-    "checkers":             ("/api/checkers",              True,  "IoE checker definitions"),
-    "cloud-statistics":     ("/api/cloud-statistics",      False, "Cloud deployment statistics"),
-    "dashboards":           ("/api/dashboards",            True,  "Dashboard definitions"),
-    "directories":          ("/api/directories",           True,  "Monitored AD directories"),
-    "email-notifiers":      ("/api/email-notifiers",       True,  "Email notification configurations"),
-    "infrastructures":      ("/api/infrastructures",       True,  "Monitored AD forests / infrastructures"),
-    "ldap-configuration":   ("/api/ldap-configuration",    False, "LDAP bind configuration"),
-    "license":              ("/api/license",               False, "License information"),
-    "lockout-policy":       ("/api/lockout-policy",        False, "Account lockout policy"),
-    "preferences":          ("/api/preferences",           False, "Current user preferences"),
-    "profiles":             ("/api/profiles",              True,  "Security profiles (scope for IoE/IoA data)"),
-    "reasons":              ("/api/reasons",               True,  "Deviance closure reasons"),
-    "report-access-token":  ("/api/report-access-token",   False, "Token for embedded report access"),
-    "roles":                ("/api/roles",                 True,  "Console user roles and permissions"),
-    "saml-configuration":   ("/api/saml-configuration",    False, "SAML SSO configuration"),
-    "syslogs":              ("/api/syslogs",               True,  "Syslog forwarding configurations"),
-    "users":                ("/api/users",                 True,  "Console user accounts"),
+from typing import NamedTuple
+
+_R = frozenset({"GET"})
+_RW = frozenset({"GET", "PATCH", "DELETE"})
+_RC = frozenset({"GET", "POST"})
+_RP = frozenset({"GET", "PATCH"})
+_NONE: frozenset[str] = frozenset()
+
+
+class TIEResource(NamedTuple):
+    """A flat resource and the methods it actually serves.
+
+    `collection` applies to the base path, `item` to `<path>/{id}`. An empty
+    `item` means there is no per-id route at all — asking for one used to
+    produce a confident 404 instead of a local refusal.
+    """
+
+    path: str
+    collection: frozenset[str]
+    item: frozenset[str]
+    description: str
+
+    @property
+    def supports_id(self) -> bool:
+        return bool(self.item)
+
+
+# Method sets come from Tenable's published OpenAPI spec and were spot-checked
+# with GET against a live TIE v3.120.1 SaaS tenant. Notably: /api/ad-objects/{id}
+# and /api/attack-types/{id} do not exist, and /api/directories/{id} serves GET
+# only -- directory writes go through /api/infrastructures/{infraId}/directories/{id}.
+TIE_RESOURCES: dict[str, TIEResource] = {
+    "about":                TIEResource("/api/about",                 _R,    _NONE, "Product version and build info"),
+    "ad-objects":           TIEResource("/api/ad-objects",            _R,    _NONE, "AD objects; whole-collection dump, no per-id route -- use tie_search_ad_objects"),
+    "api-key":              TIEResource("/api/api-key",               _RC,   _NONE, "Current API key; POST renews it and deactivates the one in use"),
+    "application-settings": TIEResource("/api/application-settings",  _RP,   _NONE, "Global application settings"),
+    "attack-type-configuration": TIEResource("/api/attack-type-configuration", _RP, _NONE, "Attack type configuration"),
+    "attack-types":         TIEResource("/api/attack-types",          _R,    _NONE, "Attack (IoA) type definitions; no per-id route"),
+    "categories":           TIEResource("/api/categories",            _R,    _R,    "Indicator of Exposure (IoE) categories"),
+    "checkers":             TIEResource("/api/checkers",              _R,    _R,    "IoE checker definitions"),
+    "cloud-statistics":     TIEResource("/api/cloud-statistics",      _R,    _NONE, "Cloud deployment statistics"),
+    "dashboards":           TIEResource("/api/dashboards",            _RC,   _RW,   "Dashboard definitions"),
+    "directories":          TIEResource("/api/directories",           _RC,   _R,    "Monitored AD directories; per-id is read-only"),
+    "email-notifiers":      TIEResource("/api/email-notifiers",       _RC,   _RW,   "Email notification configurations"),
+    "infrastructures":      TIEResource("/api/infrastructures",       _RC,   _RW,   "Monitored AD forests / infrastructures"),
+    "ldap-configuration":   TIEResource("/api/ldap-configuration",    _RP,   _NONE, "LDAP bind configuration"),
+    "license":              TIEResource("/api/license",               _RC,   _NONE, "License information"),
+    "lockout-policy":       TIEResource("/api/lockout-policy",        _RP,   _NONE, "Account lockout policy"),
+    "preferences":          TIEResource("/api/preferences",           _RP,   _NONE, "Current user preferences"),
+    "profiles":             TIEResource("/api/profiles",              _RC,   _RW,   "Security profiles (scope for IoE/IoA data)"),
+    "reasons":              TIEResource("/api/reasons",               _R,    _R,    "Deviance closure reasons"),
+    "report-access-token":  TIEResource("/api/report-access-token",   _R,    _NONE, "Token for embedded report access"),
+    "roles":                TIEResource("/api/roles",                 _RC,   _RW,   "Console user roles and permissions"),
+    "saml-configuration":   TIEResource("/api/saml-configuration",    _RP,   _NONE, "SAML SSO configuration"),
+    "syslogs":              TIEResource("/api/syslogs",               _RC,   _RW,   "Syslog forwarding configurations"),
+    "users":                TIEResource("/api/users",                 _RC,   _RW,   "Console user accounts"),
 }
 
 # Nested resources exposed via dedicated tools. Documented here for discovery.
@@ -59,10 +88,15 @@ NESTED_ENDPOINTS: dict[str, str] = {
 
 
 def catalog_as_text() -> str:
-    lines = ["Flat resources (use with tie_resource_action):\n"]
-    for name, (path, has_id, desc) in sorted(TIE_RESOURCES.items()):
-        id_note = "  [get-by-id]" if has_id else ""
-        lines.append(f"  {name:<22} {path:<32} {desc}{id_note}")
+    lines = [
+        "Flat resources (use with tie_resource_action).",
+        "Methods shown are what the API actually serves: collection | item(/{id}).",
+        "'-' means that level has no route, so the matching action is refused locally.\n",
+    ]
+    for name, r in sorted(TIE_RESOURCES.items()):
+        coll = ",".join(sorted(r.collection)) or "-"
+        item = ",".join(sorted(r.item)) or "-"
+        lines.append(f"  {name:<22} {r.path:<32} [{coll} | {item}]  {r.description}")
     lines.append("\nNested resources (use the dedicated tools noted):\n")
     for name, doc in NESTED_ENDPOINTS.items():
         lines.append(f"  {name:<20} {doc}")

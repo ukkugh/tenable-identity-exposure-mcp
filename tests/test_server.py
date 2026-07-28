@@ -13,6 +13,11 @@ from tenable_tie_mcp import server
 from .conftest import FakeClient
 
 
+def client_call(client: FakeClient, index: int) -> tuple[str, str]:
+    call = client.calls[index]
+    return call["method"], call["path"]
+
+
 class TestDeviancesBulkEnvelope:
     """GET /api/deviances/changed returns a HAL envelope, not a bare array.
     Misreading it turns "hundreds of findings" into a silent "count: 0"."""
@@ -200,6 +205,60 @@ class TestProtectedResources:
         assert fake_client.calls[0]["method"] == "POST"
 
 
+class TestUnsupportedActionsAreRefusedLocally:
+    """The catalogue claimed get-by-id for routes that do not exist. Verified
+    against a live TIE v3.120.1 tenant and the published OpenAPI spec."""
+
+    @pytest.fixture(autouse=True)
+    def _writes_enabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(server, "_read_only", False)
+
+    @pytest.mark.parametrize("resource", ["ad-objects", "attack-types"])
+    async def test_get_by_id_refused_where_no_item_route_exists(
+        self, resource: str, fake_client: FakeClient
+    ) -> None:
+        result = await server.tie_resource_action(resource=resource, action="get", id=1)
+
+        assert "error" in result
+        assert fake_client.calls == []
+
+    @pytest.mark.parametrize("action", ["update", "delete"])
+    async def test_directories_item_is_read_only(
+        self, action: str, fake_client: FakeClient
+    ) -> None:
+        """/api/directories/{id} serves GET only; writes go through
+        /api/infrastructures/{i}/directories/{id}."""
+        result = await server.tie_resource_action(resource="directories", action=action, id=6)
+
+        assert "error" in result
+        assert fake_client.calls == []
+
+    async def test_directories_get_by_id_still_works(self, fake_client: FakeClient) -> None:
+        await server.tie_resource_action(resource="directories", action="get", id=6)
+
+        assert client_call(fake_client, 0) == ("GET", "/api/directories/6")
+
+    async def test_create_refused_on_read_only_collection(
+        self, fake_client: FakeClient
+    ) -> None:
+        result = await server.tie_resource_action(resource="categories", action="create", body={})
+
+        assert "error" in result
+        assert fake_client.calls == []
+
+    async def test_singleton_update_patches_the_collection_path(
+        self, fake_client: FakeClient
+    ) -> None:
+        await server.tie_resource_action(resource="preferences", action="update", body={"a": 1})
+
+        assert client_call(fake_client, 0) == ("PATCH", "/api/preferences")
+
+    async def test_supported_item_write_is_dispatched(self, fake_client: FakeClient) -> None:
+        await server.tie_resource_action(resource="dashboards", action="delete", id=3)
+
+        assert client_call(fake_client, 0) == ("DELETE", "/api/dashboards/3")
+
+
 class TestSearchEndpointsAreReads:
     """TIE models several searches as POST. Read-only mode must not block the
     routes catalog.py tells the model to use."""
@@ -236,6 +295,41 @@ class TestSearchEndpointsAreReads:
 
         assert "error" in result
         assert fake_client.calls == []
+
+
+class TestRecentActivityBudget:
+    """max_items is documented as a cap per category, but the IoA branch applied
+    it per directory, so a four-domain forest could return 4x the stated cap
+    with nothing in `notes` to say so."""
+
+    def _tenant(self, directories: int, attacks_each: int) -> FakeClient:
+        dirs = [{"id": 100 + i} for i in range(directories)]
+        responses: dict[str, Any] = {"/api/directories": dirs}
+        for d in dirs:
+            responses["/api/profiles/1/attacks"] = [
+                {"id": n, "date": f"2026-07-28T0{n % 10}:00:00.000Z", "directoryId": d["id"]}
+                for n in range(attacks_each)
+            ]
+        responses["/api/profiles/1/alerts"] = []
+        return FakeClient(responses=responses)
+
+    async def test_ioa_cap_is_global_not_per_directory(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = self._tenant(directories=4, attacks_each=5)
+        monkeypatch.setattr(server, "_client", client)
+
+        result = await server.tie_recent_activity(hours=1, max_items=5)
+
+        assert result["counts"]["ioa"] <= 5
+
+    async def test_ioa_truncation_is_reported(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = self._tenant(directories=4, attacks_each=5)
+        monkeypatch.setattr(server, "_client", client)
+
+        result = await server.tie_recent_activity(hours=1, max_items=5)
+
+        assert any("IoA" in n for n in result["notes"])
 
 
 class TestModuleDefaults:

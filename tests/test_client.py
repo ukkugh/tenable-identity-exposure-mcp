@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import httpx
 import pytest
 
 from tenable_tie_mcp.client import TIEApiError, TIEClient, TIEConfig
@@ -83,3 +84,46 @@ class TestAbsoluteUrlRejection:
             assert client._normalise_path("/api/about") == "/api/about"
         finally:
             await client.close()
+
+
+class TestTransportErrors:
+    """Every tool catches only TIEApiError. Transport failures used to sail past
+    those handlers, and a timeout surfaced as a message with no content at all
+    because httpx.ConnectTimeout stringifies to the empty string."""
+
+    async def _request_with(self, exc: Exception) -> TIEApiError:
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise exc
+
+        client = TIEClient(_config())
+        client._http = httpx.AsyncClient(
+            base_url="https://tie.example",
+            headers={"X-API-Key": "SENTINEL"},
+            transport=httpx.MockTransport(handler),
+        )
+        try:
+            with pytest.raises(TIEApiError) as caught:
+                await client.request("GET", "/api/about")
+            return caught.value
+        finally:
+            await client.close()
+
+    async def test_connect_error_becomes_a_tie_api_error(self) -> None:
+        err = await self._request_with(httpx.ConnectError("nodename nor servname provided"))
+
+        assert err.status == 0
+        assert "nodename" in str(err)
+
+    async def test_timeout_still_names_the_failure(self) -> None:
+        """ConnectTimeout carries an empty message; the class name has to
+        survive or the operator gets a bare 'Error executing tool'."""
+        err = await self._request_with(httpx.ConnectTimeout(""))
+
+        assert "ConnectTimeout" in str(err)
+
+    async def test_certificate_failure_points_at_the_setting(self) -> None:
+        err = await self._request_with(
+            httpx.ConnectError("[SSL: CERTIFICATE_VERIFY_FAILED] self-signed certificate")
+        )
+
+        assert "TIE_VERIFY_SSL" in str(err)

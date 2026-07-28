@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import os
 import posixpath
@@ -14,7 +15,7 @@ from urllib.parse import unquote, urlsplit
 import structlog
 from mcp.server.fastmcp import FastMCP
 
-from .catalog import TIE_RESOURCES, catalog_as_text
+from .catalog import TIE_RESOURCES, TIEResource, catalog_as_text
 from .client import TIEApiError, TIEClient, TIEConfig, TIEConfigError
 from .util import iso_utc, parse_iso, render_description, resolve_window, slim_list, slim_object
 
@@ -70,6 +71,10 @@ _SAFE_ID = re.compile(r"^[A-Za-z0-9_-]+$")
 
 _TRUTHY: frozenset[str] = frozenset({"true", "1", "yes", "on"})
 
+# Bound on concurrent enrichment/fan-out requests, so a wide window cannot
+# turn one tool call into a burst against the console.
+_FANOUT_CONCURRENCY = 8
+
 
 def get_client() -> TIEClient:
     if _client is None:
@@ -107,6 +112,22 @@ _NAME_ATTRIBUTES: frozenset[str] = frozenset(
 )
 
 
+def _unsupported_action_message(
+    resource: str, entry: TIEResource, action: str, method: str, level: str
+) -> str:
+    if level == "item" and not entry.item:
+        return (
+            f"Resource '{resource}' has no per-id route: {entry.path}/{{id}} does not exist, "
+            f"so action='{action}' cannot work. Use action='list' and filter the result."
+        )
+    served = ", ".join(sorted(entry.item if level == "item" else entry.collection)) or "none"
+    return (
+        f"Resource '{resource}' does not support action='{action}': "
+        f"{method} {entry.path}{'/{id}' if level == 'item' else ''} is not served by the API "
+        f"(available at that level: {served})."
+    )
+
+
 def _extract_ad_objects(raw: Any) -> list[Any] | None:
     """Pull AD objects out of a page, or None if the shape is unknown."""
     if isinstance(raw, list):
@@ -137,9 +158,12 @@ def _has_next_page(raw: Any) -> bool | None:
 
 def _attribute_contains(obj: dict[str, Any], attribute: str, needle: str) -> bool:
     for a in obj.get("objectAttributes") or []:
-        if isinstance(a, dict) and str(a.get("name", "")).lower() == attribute:
-            if needle in str(a.get("value", "")).lower():
-                return True
+        if (
+            isinstance(a, dict)
+            and str(a.get("name", "")).lower() == attribute
+            and needle in str(a.get("value", "")).lower()
+        ):
+            return True
     return False
 
 
@@ -151,9 +175,11 @@ def _object_name_contains(obj: dict[str, Any], needle: str) -> bool:
     for a in obj.get("objectAttributes") or []:
         if not isinstance(a, dict):
             continue
-        if str(a.get("name", "")).lower() in _NAME_ATTRIBUTES:
-            if needle in str(a.get("value", "")).lower():
-                return True
+        if (
+            str(a.get("name", "")).lower() in _NAME_ATTRIBUTES
+            and needle in str(a.get("value", "")).lower()
+        ):
+            return True
     return False
 
 
@@ -186,7 +212,7 @@ def _protected_resource_for_path(path: str) -> str | None:
     """Return the protected resource a raw API path targets, if any."""
     normalised = _canonical_path(path)
     for name in sorted(_PROTECTED_RESOURCES):
-        base = _canonical_path(TIE_RESOURCES[name][0])
+        base = _canonical_path(TIE_RESOURCES[name].path)
         if normalised == base or normalised.startswith(base + "/"):
             return name
     return None
@@ -309,36 +335,37 @@ async def tie_resource_action(
         available = ", ".join(sorted(TIE_RESOURCES.keys()))
         return {"error": f"Unknown resource '{resource}'. Available: {available}"}
 
-    base_path, supports_id, _ = entry
+    base_path = entry.path
 
     method: str
     path: str
+    level: str
 
     match action:
         case "list":
-            method, path = "GET", base_path
+            method, path, level = "GET", base_path, "collection"
         case "get":
             if id is None:
                 return {"error": "action='get' requires an id"}
-            if not supports_id:
-                return {"error": f"Resource '{resource}' does not support get-by-id"}
-            method, path = "GET", f"{base_path}/{id}"
+            method, path, level = "GET", f"{base_path}/{id}", "item"
         case "create":
-            method, path = "POST", base_path
+            method, path, level = "POST", base_path, "collection"
         case "update":
-            if not supports_id:
+            if id is None:
                 # Singleton config resources (e.g. application-settings) PATCH the base path.
-                method, path = "PATCH", base_path
-            elif id is None:
-                return {"error": "action='update' requires an id for this resource"}
+                method, path, level = "PATCH", base_path, "collection"
             else:
-                method, path = "PATCH", f"{base_path}/{id}"
+                method, path, level = "PATCH", f"{base_path}/{id}", "item"
         case "delete":
             if id is None:
                 return {"error": "action='delete' requires an id"}
-            method, path = "DELETE", f"{base_path}/{id}"
+            method, path, level = "DELETE", f"{base_path}/{id}", "item"
         case _:
             return {"error": f"Unknown action '{action}'. Use: list, get, create, update, delete"}
+
+    allowed = entry.item if level == "item" else entry.collection
+    if method not in allowed:
+        return {"error": _unsupported_action_message(resource, entry, action, method, level)}
 
     try:
         return await client.request(method, path, params=params, json=body)
@@ -467,7 +494,7 @@ async def tie_deviances(
     except TIEApiError as exc:
         return {"error": str(exc), "status": exc.status}
 
-    items = results if isinstance(results, list) else results
+    items = results
     return {
         "window": {"start": iso_utc(start), "end": iso_utc(end), "timezone": "UTC"},
         "profileId": profile_id,
@@ -915,7 +942,9 @@ async def tie_recent_activity(
         include_ioe: Include IoE deviance alerts (default True).
         include_ioa: Include IoA attacks (default True).
         directory_ids: Restrict to these directory ids (default: all in scope).
-        max_items: Cap on enriched items per category (default 50); truncation is reported.
+        max_items: Cap on items per category — IoE and IoA are budgeted separately
+            (default 50). The IoA cap applies across all directories, not per
+            directory; any truncation is reported in `notes`.
         verbose: If False (default), attribute values are slimmed.
     """
     client = get_client()
@@ -937,6 +966,7 @@ async def tie_recent_activity(
 
     # ---- IoE: page the alert feed (newest-first) until older than the window ----
     if include_ioe:
+        pending: list[tuple[dict[str, Any], dict[str, Any]]] = []
         ioe_count = 0
         truncated = False
         page = 1
@@ -976,53 +1006,74 @@ async def tie_recent_activity(
                     "directoryId": a.get("directoryId"),
                     "read": a.get("read"),
                 }
-                # Enrich with deviance detail (checker + rendered description).
-                infra_id, dev_id = a.get("infrastructureId"), a.get("devianceId")
-                dir_id = a.get("directoryId")
-                if infra_id and dir_id and dev_id:
-                    try:
-                        dev = await client.get(
-                            f"/api/infrastructures/{infra_id}/directories/{dir_id}/deviances/{dev_id}"
-                        )
-                        if isinstance(dev, dict):
-                            entry["checkerId"] = dev.get("checkerId")
-                            entry["eventDate"] = dev.get("eventDate")
-                            entry["description"] = render_description(dev) or dev.get("description")
-                            if verbose:
-                                entry["deviance"] = slim_object(dev, verbose)
-                    except TIEApiError:
-                        pass
-                items.append(entry)
+                pending.append((entry, a))
                 ioe_count += 1
             page += 1
         if truncated:
             notes.append(f"IoE truncated at max_items={max_items}; increase it or narrow the window.")
 
+        # Enrich concurrently. One awaited GET per alert in sequence turned a
+        # 50-alert window into 50 serial round trips.
+        if pending:
+            semaphore = asyncio.Semaphore(_FANOUT_CONCURRENCY)
+
+            async def enrich(entry: dict[str, Any], alert: dict[str, Any]) -> None:
+                infra_id = alert.get("infrastructureId")
+                dir_id = alert.get("directoryId")
+                dev_id = alert.get("devianceId")
+                if not (infra_id and dir_id and dev_id):
+                    return
+                async with semaphore:
+                    try:
+                        dev = await client.get(
+                            f"/api/infrastructures/{infra_id}/directories/{dir_id}"
+                            f"/deviances/{dev_id}"
+                        )
+                    except TIEApiError:
+                        return
+                if isinstance(dev, dict):
+                    entry["checkerId"] = dev.get("checkerId")
+                    entry["eventDate"] = dev.get("eventDate")
+                    entry["description"] = render_description(dev) or dev.get("description")
+                    if verbose:
+                        entry["deviance"] = slim_object(dev, verbose)
+
+            await asyncio.gather(*(enrich(e, a) for e, a in pending))
+        items.extend(entry for entry, _ in pending)
+
     # ---- IoA: attacks per directory within the window ----
     if include_ioa:
-        for did in dirs:
-            try:
-                attacks = await client.get(
-                    f"/api/profiles/{profile_id}/attacks",
-                    params={
-                        "resourceType": "directory",
-                        "resourceValue": str(did),
-                        "dateStart": iso_utc(start),
-                        "dateEnd": iso_utc(end),
-                        "includeClosed": "true",
-                        "limit": max_items,
-                        "order": "desc",
-                    },
-                )
-            except TIEApiError as exc:
-                notes.append(f"IoA error for directory {did}: {exc}")
+        semaphore = asyncio.Semaphore(_FANOUT_CONCURRENCY)
+
+        async def fetch_attacks(did: int) -> tuple[int, Any]:
+            async with semaphore:
+                try:
+                    return did, await client.get(
+                        f"/api/profiles/{profile_id}/attacks",
+                        params={
+                            "resourceType": "directory",
+                            "resourceValue": str(did),
+                            "dateStart": iso_utc(start),
+                            "dateEnd": iso_utc(end),
+                            "includeClosed": "true",
+                            "limit": max_items,
+                            "order": "desc",
+                        },
+                    )
+                except TIEApiError as exc:
+                    return did, exc
+
+        ioa_items: list[dict[str, Any]] = []
+        for did, attacks in await asyncio.gather(*(fetch_attacks(d) for d in dirs)):
+            if isinstance(attacks, TIEApiError):
+                notes.append(f"IoA error for directory {did}: {attacks}")
                 continue
             if not isinstance(attacks, list):
                 continue
             for atk in attacks:
                 if not isinstance(atk, dict):
                     continue
-                items.append({
+                ioa_items.append({
                     "kind": "ioa",
                     "date": atk.get("date"),
                     "attackId": atk.get("id"),
@@ -1031,6 +1082,17 @@ async def tie_recent_activity(
                     "source": atk.get("source"),
                     "destination": atk.get("destination"),
                 })
+
+        # max_items is a cap per category. Applying it per directory instead
+        # returned len(directories) times the documented budget, silently.
+        if len(ioa_items) > max_items:
+            ioa_items.sort(key=lambda x: x.get("date") or "", reverse=True)
+            notes.append(
+                f"IoA truncated: {len(ioa_items)} attacks matched across {len(dirs)} "
+                f"directories, newest {max_items} kept (max_items={max_items})."
+            )
+            ioa_items = ioa_items[:max_items]
+        items.extend(ioa_items)
 
     items.sort(key=lambda x: x.get("date") or "", reverse=True)
 

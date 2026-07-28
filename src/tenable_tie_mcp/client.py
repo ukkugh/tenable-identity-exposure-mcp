@@ -96,7 +96,23 @@ class TIEClient:
             raise TIEApiError(0, method, path, str(exc)) from exc
         log.debug("tie_request", method=method, path=path, params=params)
 
-        resp = await self._http.request(method, path, params=params, json=json)
+        try:
+            resp = await self._http.request(method, path, params=params, json=json)
+        except httpx.HTTPError as exc:
+            # Every tool catches TIEApiError and nothing else, so transport
+            # failures would otherwise escape as a bare MCP error. Some of them
+            # (ConnectTimeout) stringify to nothing at all, which is why the
+            # exception class name is kept.
+            detail = str(exc).strip()
+            hint = ""
+            if "CERTIFICATE_VERIFY_FAILED" in detail or "SSLError" in type(exc).__name__:
+                hint = (
+                    " -- if this is an on-premises appliance with an internal CA, set "
+                    "TIE_VERIFY_SSL=false or pass --no-verify-ssl"
+                )
+            raise TIEApiError(
+                0, method, path, f"{type(exc).__name__}: {detail or '(no detail)'}{hint}"
+            ) from exc
 
         if not resp.is_success:
             raise TIEApiError(resp.status_code, method, path, resp.text[:500])

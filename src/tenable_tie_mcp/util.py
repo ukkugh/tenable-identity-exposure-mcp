@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 # TIE templates embed attribute placeholders like "<%= GpoPath %>".
@@ -16,7 +16,7 @@ _VALUE_LIMIT = 200
 
 def iso_utc(dt: datetime) -> str:
     """Format an aware datetime as TIE-style UTC ISO 8601 with milliseconds + Z."""
-    dt = dt.astimezone(timezone.utc)
+    dt = dt.astimezone(UTC)
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
 
 
@@ -27,10 +27,12 @@ def parse_iso(value: str) -> datetime:
     docstrings promise. Without this, `.astimezone()` would read them as host
     local time and skew the window by the machine's UTC offset.
     """
-    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    # fromisoformat has understood a trailing "Z" since Python 3.11, which the
+    # project requires.
+    dt = datetime.fromisoformat(value)
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 
 def resolve_window(
@@ -44,7 +46,7 @@ def resolve_window(
     Explicit date_start/date_end win; otherwise the window is the last `hours`
     (or `default_hours`) ending now. All times are UTC-aware.
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     end = parse_iso(date_end) if date_end else now
     if date_start:
         start = parse_iso(date_start)

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -25,17 +25,17 @@ class TestParseIso:
         """Tool docstrings document these parameters as UTC; a KST host must not
         shift the instant by 9 hours."""
         assert parse_iso("2026-07-28T00:00:00") == datetime(
-            2026, 7, 28, 0, 0, tzinfo=timezone.utc
+            2026, 7, 28, 0, 0, tzinfo=UTC
         )
 
     def test_z_suffix_is_utc(self, seoul_timezone: None) -> None:
         assert parse_iso("2026-07-28T00:00:00.000Z") == datetime(
-            2026, 7, 28, 0, 0, tzinfo=timezone.utc
+            2026, 7, 28, 0, 0, tzinfo=UTC
         )
 
     def test_explicit_offset_is_honoured(self, seoul_timezone: None) -> None:
         assert parse_iso("2026-07-28T09:00:00+09:00") == datetime(
-            2026, 7, 28, 0, 0, tzinfo=timezone.utc
+            2026, 7, 28, 0, 0, tzinfo=UTC
         )
 
 
