@@ -118,6 +118,11 @@ accounts inside your Tenable VM container that will *not* work here.
 
 ## Install & run
 
+**Setting this up for the first time?** [ONBOARDING.md](ONBOARDING.md) walks
+through it end to end on Windows, Linux, and macOS — install, getting an API
+key, registering with Claude Code, and a set of checks to confirm it works.
+The rest of this section is the short version.
+
 ```bash
 python -m venv .venv && . .venv/bin/activate
 pip install -e .
