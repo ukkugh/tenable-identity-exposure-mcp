@@ -8,6 +8,19 @@ Verified end-to-end against a live TIE SaaS instance (`v3.120.1`).
 > built with assistance from Claude — treat its output as a starting point and
 > validate responses against the Tenable console before acting on them.
 
+> **Origin:** this repository builds on
+> [knethteo/tenable-identity-exposure-mcp](https://github.com/knethteo/tenable-identity-exposure-mcp)
+> by Kenneth Teo, MIT-licensed. See `LICENSE` for the original copyright.
+
+### Credentials are never stored in this repository
+
+There is no API key here, and there never has been — `.env` is git-ignored and
+absent from the history. Every user supplies their own key at runtime; see
+[Configuration](#configuration). TIE API keys are **per-user**, **do not
+expire**, and inherit the issuing account's console permissions, so share a
+single key only if you are willing to lose per-person attribution in the TIE
+audit log. Prefer one least-privilege key per person.
+
 ## Tools
 
 | Tool | Description |
