@@ -9,9 +9,13 @@ description = "MCP server for Tenable Identity Exposure"
 license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
-    # 1.9.0 is the first release with the streamable-http transport that
-    # --transport http selects; 1.2.0 raises ValueError there.
-    "mcp>=1.9.0",
+    # Lower bound: 1.9.0 is the first release with the streamable-http transport
+    # that --transport http selects; 1.2.0 raises ValueError there.
+    # Upper bound: mcp 2.0.0 moved mcp.server.fastmcp to mcp.server.mcpserver and
+    # renamed FastMCP to MCPServer, so server.py fails to import against it. With
+    # the bound open, a fresh `pip install -e .` resolved to 2.0.0 and every clone
+    # was dead on arrival with ModuleNotFoundError.
+    "mcp>=1.9.0,<2",
     "httpx>=0.27.0",
     "structlog>=24.0.0",
 ]

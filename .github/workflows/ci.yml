@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # A green build can go red without a commit: dependencies are declared as
+  # ranges, so a new upstream release can break a fresh install on its own.
+  # That is exactly how mcp 2.0.0 broke every clone while the pinned local
+  # .venv kept passing. Run weekly so we hear it from CI, not from a colleague.
+  schedule:
+    - cron: "0 6 * * 1"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # Deliberately no lockfile and no pip cache: this job's job is to prove a
+      # clone installs today, resolving dependencies exactly as a new colleague
+      # would. Caching the resolution would hide the failure it exists to catch.
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e . pytest pytest-asyncio ruff mypy
+
+      - name: Show resolved dependency versions
+        run: pip list
+
+      # Fails loudly if the package cannot even be imported — the shape mcp
+      # 2.0.0 took (ModuleNotFoundError: No module named 'mcp.server.fastmcp').
+      - name: Import smoke test
+        run: python -c "import tenable_tie_mcp.server; print('import OK')"
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Type check
+        run: mypy
+
+      - name: Test
+        run: pytest -q
