@@ -42,7 +42,6 @@ class TIEResource(NamedTuple):
 TIE_RESOURCES: dict[str, TIEResource] = {
     "about":                TIEResource("/api/about",                 _R,    _NONE, "Product version and build info"),
     "ad-objects":           TIEResource("/api/ad-objects",            _R,    _NONE, "AD objects; whole-collection dump, no per-id route -- use tie_search_ad_objects"),
-    "api-key":              TIEResource("/api/api-key",               _RC,   _NONE, "Current API key; POST renews it and deactivates the one in use"),
     "application-settings": TIEResource("/api/application-settings",  _RP,   _NONE, "Global application settings"),
     "attack-type-configuration": TIEResource("/api/attack-type-configuration", _RP, _NONE, "Attack type configuration"),
     "attack-types":         TIEResource("/api/attack-types",          _R,    _NONE, "Attack (IoA) type definitions; no per-id route"),
@@ -59,7 +58,6 @@ TIE_RESOURCES: dict[str, TIEResource] = {
     "preferences":          TIEResource("/api/preferences",           _RP,   _NONE, "Current user preferences"),
     "profiles":             TIEResource("/api/profiles",              _RC,   _RW,   "Security profiles (scope for IoE/IoA data)"),
     "reasons":              TIEResource("/api/reasons",               _R,    _R,    "Deviance closure reasons"),
-    "report-access-token":  TIEResource("/api/report-access-token",   _R,    _NONE, "Token for embedded report access"),
     "roles":                TIEResource("/api/roles",                 _RC,   _RW,   "Console user roles and permissions"),
     "saml-configuration":   TIEResource("/api/saml-configuration",    _RP,   _NONE, "SAML SSO configuration"),
     "syslogs":              TIEResource("/api/syslogs",               _RC,   _RW,   "Syslog forwarding configurations"),
@@ -83,7 +81,15 @@ NESTED_ENDPOINTS: dict[str, str] = {
     "attack-type-options": "GET/POST /api/profiles/{profileId}/attack-types/{attackTypeId}/attack-type-options -> use tie_request",
     "reasons (checker)":   "GET  /api/profiles/{profileId}/checkers/{checkerId}/reasons                       -> use tie_request",
     "ad-objects (search)": "POST /api/profiles/{profileId}/checkers/{checkerId}/ad-objects/search             -> use tie_request",
-    "relays (linking)":    "GET  /api/relays/linking-key   (relay setup key)                                  -> use tie_request",
+}
+
+# Endpoints this server refuses for every method, credential-bearing ones
+# included. Advertised here so the model is told once, instead of discovering
+# the boundary one refusal at a time and retrying around it.
+BLOCKED_ENDPOINTS: dict[str, str] = {
+    "/api/api-key": "returns the console API key this server authenticates with",
+    "/api/report-access-token": "returns the embedded-report access token",
+    "/api/relays/linking-key": "returns the relay enrolment secret",
 }
 
 
@@ -100,4 +106,7 @@ def catalog_as_text() -> str:
     lines.append("\nNested resources (use the dedicated tools noted):\n")
     for name, doc in NESTED_ENDPOINTS.items():
         lines.append(f"  {name:<20} {doc}")
+    lines.append("\nNever accessible through this server, by any method or tool:\n")
+    for path, why in BLOCKED_ENDPOINTS.items():
+        lines.append(f"  {path:<30} {why}")
     return "\n".join(lines)

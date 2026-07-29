@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import subprocess
 import sys
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
-from tenable_tie_mcp import server
+from tenable_tie_mcp import catalog, server
 
 from .conftest import FakeClient
 
@@ -128,23 +128,64 @@ class TestProtectedResources:
 
     @pytest.mark.parametrize(
         "resource",
-        ["api-key", "users", "roles", "saml-configuration", "ldap-configuration"],
+        [
+            "users",
+            "roles",
+            "saml-configuration",
+            "ldap-configuration",
+            "syslogs",
+            # Same alert-forwarding exfiltration class as syslogs: an email
+            # notifier can be pointed at an attacker's mailbox.
+            "email-notifiers",
+            "lockout-policy",
+            "application-settings",
+            "attack-type-configuration",
+            "license",
+            # Deleting an infrastructure stops monitoring a whole AD forest.
+            "infrastructures",
+            "directories",
+        ],
     )
+    @pytest.mark.parametrize("action", ["create", "update", "delete"])
     async def test_protected_resource_write_refused(
-        self, resource: str, fake_client: FakeClient
+        self, resource: str, action: str, fake_client: FakeClient
     ) -> None:
-        result = await server.tie_resource_action(resource=resource, action="create", body={})
+        result = await server.tie_resource_action(
+            resource=resource, action=action, id=1, body={}
+        )
 
         assert "error" in result
         assert "protected" in result["error"].lower()
         assert fake_client.calls == []
 
-    async def test_protected_path_refused_via_raw_request(self, fake_client: FakeClient) -> None:
-        result = await server.tie_request(method="POST", path="/api/api-key")
+    @pytest.mark.parametrize(
+        "method,path",
+        [
+            ("POST", "/api/users"),
+            ("PATCH", "/api/saml-configuration"),
+            ("DELETE", "/api/syslogs/2"),
+            ("PATCH", "/api/email-notifiers/2"),
+            # The catalogued base path is /api/directories, but the route that
+            # actually mutates a monitored directory is nested under an
+            # infrastructure — matching only the base path left it open.
+            ("PATCH", "/api/infrastructures/5/directories/8"),
+            ("DELETE", "/api/infrastructures/5"),
+            # Not catalogued resources at all, so naming them in
+            # _PROTECTED_RESOURCES could never have reached them. POST
+            # /api/login takes a username/password pair.
+            ("POST", "/api/login"),
+            ("POST", "/api/logout"),
+            ("POST", "/api/relays"),
+        ],
+    )
+    async def test_protected_path_refused_via_raw_request(
+        self, method: str, path: str, fake_client: FakeClient
+    ) -> None:
+        result = await server.tie_request(method=method, path=path)  # type: ignore[arg-type]
 
-        assert "error" in result
+        assert "error" in result, f"{method} {path} was not refused"
         assert "protected" in result["error"].lower()
-        assert fake_client.calls == []
+        assert fake_client.calls == [], f"{method} {path} reached the client"
 
     @pytest.mark.parametrize(
         "path",
@@ -203,6 +244,92 @@ class TestProtectedResources:
         await server.tie_resource_action(resource="dashboards", action="create", body={"a": 1})
 
         assert fake_client.calls[0]["method"] == "POST"
+
+
+class TestCredentialEndpointsAreNeverReadable:
+    """Guarding only writes left the credential itself readable.
+
+    GET /api/api-key returns the console key this server authenticates with. A
+    model that reads it puts a non-expiring credential carrying the issuing
+    account's full permissions into the transcript, and read-only mode stops
+    mattering — whoever sees it can drive the console directly.
+    """
+
+    SECRET_PATHS: ClassVar[list[str]] = [
+        "/api/api-key",
+        "/api/report-access-token",
+        "/api/relays/linking-key",
+    ]
+
+    @pytest.fixture(params=[True, False], autouse=True)
+    def _both_modes(self, request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+        """--allow-writes must not matter here: these are refused either way."""
+        monkeypatch.setattr(server, "_read_only", request.param)
+
+    @pytest.mark.parametrize("path", SECRET_PATHS)
+    @pytest.mark.parametrize("method", ["GET", "POST", "PUT", "PATCH", "DELETE"])
+    async def test_every_method_refused_via_raw_request(
+        self, method: str, path: str, fake_client: FakeClient
+    ) -> None:
+        result = await server.tie_request(method=method, path=path)  # type: ignore[arg-type]
+
+        assert "error" in result, f"{method} {path} was not refused"
+        assert "credential" in result["error"].lower()
+        assert fake_client.calls == [], f"{method} {path} reached the client"
+
+    @pytest.mark.parametrize("resource", ["api-key", "report-access-token"])
+    @pytest.mark.parametrize("action", ["list", "get", "create", "update", "delete"])
+    async def test_every_action_refused_via_resource_action(
+        self, resource: str, action: str, fake_client: FakeClient
+    ) -> None:
+        result = await server.tie_resource_action(resource=resource, action=action, id=1)
+
+        assert "error" in result, f"{action} on {resource} was not refused"
+        assert "credential" in result["error"].lower()
+        assert fake_client.calls == []
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            # Same spelling tricks the write guard already had to survive.
+            "/api/api-key?x=1",
+            "/api/api-key#frag",
+            "/api/API-KEY",
+            "/API/Api-Key",
+            "/api//api-key",
+            "/api/api-key/",
+            "/api/./api-key",
+            "/api/dashboards/../api-key",
+            "/api/dashboards/%2e%2e/api-key",
+            # Nested under a secret path.
+            "/api/relays/linking-key/renew",
+        ],
+    )
+    async def test_secret_path_spellings_refused(
+        self, path: str, fake_client: FakeClient
+    ) -> None:
+        result = await server.tie_request(method="GET", path=path)
+
+        assert "error" in result, f"{path} was not refused"
+        assert fake_client.calls == [], f"{path} reached the client"
+
+    async def test_sibling_paths_are_not_over_blocked(self, fake_client: FakeClient) -> None:
+        """The match is path-segment based, not a substring: only the credential
+        endpoints are blocked, not everything under /api/relays."""
+        await server.tie_request(method="GET", path="/api/relays")
+
+        assert client_call(fake_client, 0) == ("GET", "/api/relays")
+
+    def test_credential_resources_are_not_advertised(self) -> None:
+        assert "api-key" not in catalog.TIE_RESOURCES
+        assert "report-access-token" not in catalog.TIE_RESOURCES
+        text = catalog.catalog_as_text()
+        assert "Never accessible" in text
+        for path in self.SECRET_PATHS:
+            assert path in text, f"{path} is not declared blocked in the catalog"
+
+    def test_enforced_and_advertised_lists_cannot_drift(self) -> None:
+        assert list(server._SECRET_PATHS) == list(catalog.BLOCKED_ENDPOINTS)
 
 
 class TestUnsupportedActionsAreRefusedLocally:

@@ -36,11 +36,31 @@ Non-GET calls are **refused** unless the server is started with `--allow-writes`
 (or `TIE_ALLOW_WRITES=true`). This applies to `tie_request` and to the
 `create`/`update`/`delete` actions of `tie_resource_action`.
 
-Some resources are never writable, even with `--allow-writes`:
-`api-key`, `users`, `roles`, `saml-configuration`, `ldap-configuration`,
-`syslogs`, `lockout-policy`, `application-settings`, `attack-type-configuration`.
-Rotating the API key would deactivate the credential this server is running on;
-the rest reconfigure authentication, access control, or log forwarding.
+Some endpoints are never writable, even with `--allow-writes`:
+`users`, `roles`, `saml-configuration`, `ldap-configuration`, `syslogs`,
+`email-notifiers`, `lockout-policy`, `application-settings`,
+`attack-type-configuration`, `license`, `infrastructures`, `directories`, and
+the uncatalogued `/api/login`, `/api/logout`, `/api/relays`. These reconfigure
+authentication, access control, or alert/log forwarding, change the monitored AD
+topology, or — in the case of `/api/login` — would turn the server into a
+credential-testing oracle for the console. The block covers nested routes too,
+so `PATCH /api/infrastructures/{i}/directories/{d}` is refused, not just the
+top-level path.
+
+**Credential endpoints are never *readable* either**, by any method or tool and
+regardless of `--allow-writes`:
+
+| Endpoint | Why |
+|---|---|
+| `/api/api-key` | returns the console API key this server authenticates with |
+| `/api/report-access-token` | returns the embedded-report access token |
+| `/api/relays/linking-key` | returns the relay enrolment secret |
+
+Read-only mode is worth nothing if the model can read the key: TIE API keys do
+not expire and carry the issuing account's full console permissions, so anyone
+who sees the transcript could drive the console directly. `tie_catalog` declares
+these endpoints as blocked so the model is told once rather than retrying around
+one refusal at a time.
 
 `tie_request` also refuses absolute URLs — only server-relative paths such as
 `/api/about` are accepted, so the API key cannot be sent to another host.
